@@ -84,7 +84,7 @@ load_gas = function(path = getwd(), years = 2014:2016){
 Downloading and loading all data.
 ```{r}
 years = 2012:2016 # selecting years, if the option is not specified in the get_gas and load_gas function the years 2014 to 2016 are used
-path = "" # path to save data to and load data from, default is the current path, if it is not specified in the functions below
+path = getwd() # path to save data to and load data from, default is the current path, if it is not specified in the functions below
 
 # executing the downloading and loading functions
 get_gas(path, years = years)
