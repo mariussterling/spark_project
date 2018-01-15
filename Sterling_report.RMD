@@ -1,0 +1,456 @@
+---
+title: "Spark Mini Project"
+author: "Marius Sterling"
+date: "13 Januar 2018"
+output: html_document
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+library(RCurl)
+library(sparklyr)
+library(DBI)
+library(dplyr)
+library(ggplot2)
+library(ggmap)
+```
+
+In the following you will find my report for the Spark Project which is part of the evaluation of the IT-Tools 2 course on Spark.
+
+## Setting up Spark
+```{r}
+config = spark_config() # create config file
+config$spark.executor.cores = 3 # Number of cores
+config$spark.executor.memory = "2G" # GB per core
+sc = spark_connect(master = "local", config = config) # connecting to the "local" machine
+```
+## Functions for downloading and loading the data
+I wrote function which are able to download and load the Price data. For the additional files (Readme, Stations, Services) I have added a download function.
+```{r}
+# Download function price tables
+get_gas = function(path = getwd(), years = 2014:2016, overwrite = FALSE) {
+  for(year in years){
+    # Download the files, if they are not already downloaded
+    if(!paste0("Prix",year,".csv") %in% list.files(path) | overwrite){
+      download.file(paste0(
+        "http://github.com/rvm-courses/GasPrices/raw/master/Prix",year,".zip"),
+        destfile = paste0(path,"/gas_",year,".zip"))
+      # Unzip the file
+      unzip(paste0(path,"/gas_",year,".zip"), exdir = path)
+    }
+  }
+}
+
+# Function to download the addition data
+get_addData = function(
+  path = getwd(),
+  files = c("Services2016.zip", "Stations2016.zip", "README.md"),
+  overwrite = FALSE)
+{
+  for(name in files){
+    # Downloading files if they not already exist.
+    if(!name %in% list.files(path) | overwrite){
+      # Download the files
+      download.file(
+        paste0("https://github.com/rvm-courses/GasPrices/raw/master/",name),
+        destfile = paste0(path,"/",name)
+      )
+    }
+    # Unzipping the zip files
+    if(substr(name,nchar(name)-2,nchar(name)) == "zip")
+        unzip(paste0(path,"/",name), exdir = path)
+  }
+}
+
+# Function to load all gas prices into spark context
+load_gas = function(path = getwd(), years = 2014:2016){
+  # Loading prices tables directly into the spark session.
+  # The spark data.frames are called "spGasYYYY" where YYYY stands for the year,
+  # the variables to call the registered spark table are equivalently called 'gasYYYY'
+  for(year in years){
+    eval(parse(text = paste0(
+    "gas",year,
+    " <<- spark_read_csv(sc = sc, name = paste0('spGas',year),
+                      path = paste0('",path,"/Prix',year,'.csv'),
+                      delimiter = ';', header = FALSE)%>%
+      sdf_register(name = paste0('spGas',year))")))
+   }
+}
+```
+
+
+# Data Preparation - Step 1
+Downloading and loading all data.
+```{r}
+years = 2012:2016 # selecting years, if the option is not specified in the get_gas and load_gas function the years 2014 to 2016 are used
+path = "" # path to save data to and load data from, default is the current path, if it is not specified in the functions below
+
+# executing the downloading and loading functions
+get_gas(path, years = years)
+get_addData(path)
+load_gas(path, years = years) # loading the raw gas prices
+```
+
+Merging all loaded gas price dataframes
+```{r}
+# concatenating the code to merge the tables and register the table to the spark context
+spFiles = paste0("gas",years)
+code = paste0(spFiles,collapse = ",")
+code = paste0("gasAll = sdf_bind_rows(", code,") %>% sdf_register(name = 'spGasAll')")
+# executing the code
+eval(parse(text = code))
+
+# deleting the link variables of the spark tables and dropping (deleting) the spark tables which are not needed anymore.
+rm(list = spFiles)
+for (i in paste0("spgas",years))
+  DBI::dbGetQuery(sc, paste("DROP TABLE", i))
+```
+
+Changing column names of the table (seed README.md file)
+```{r}
+gasAll %<>%
+  rename("idStation" = "V1") %>% 
+  rename("zipCode" = "V2") %>% 
+  rename("pop" = "V3") %>% 
+  rename("lat" = "V4") %>% 
+  rename("long" = "V5") %>% 
+  rename("date" = "V6") %>% 
+  rename("gasId" = "V7") %>% 
+  rename("gasType" = "V8") %>% 
+  rename("price" = "V9") %>% 
+  sdf_register(name = 'spGasAll')
+```
+
+Splitting the date variable and computing year, month and day. Scaling the longitude and Lattitude. Furthermore zipCode2 is computed which represent the first 2 digits of the zip code.
+```{r}
+gasAll %<>% 
+  mutate(year = year(date)) %>%
+  mutate(month = month(date)) %>%
+  mutate(day = day(date)) %>%
+  mutate(long = long/10^5) %>% # France lies between -8 and 5 degrees 
+  mutate(lat = lat/10^5) %>% # France lies between 42 and 50 degrees
+  mutate(zipCode2 = floor(zipCode/1000)) %>%
+  sdf_register(name = 'spGasAll')
+```
+
+# Data Preperation - Step 2
+Computing week and weekIndex. Due to an unknown reason the functions week and isoweek of the lubridate package do not work with mutate. That's why I am computing the week of the date manually.
+```{r}
+# startYear = first year in which we have data
+if(exists("years")){
+  startYear = min(years)#
+}else{
+  starYear = min(gasAll %>% distinct(year) %>%na.omit() %>% collect())
+}
+
+gasAll %<>% 
+  mutate(week = ceil(((month-1)*30 + day - 1)/7)) %>% # a month has in mean about 30 days 
+  mutate(weekIndex = (year - startYear)*52 + week) %>% # as specified in the pdf
+  sdf_register(name = 'spGasAll')
+```
+
+
+Computing the price Index by merging the table with the computed average day prices in France for each gas typ.
+```{r}
+gasAll %<>% 
+  left_join(
+    y = gasAll %>% # computing the avg. day prices for each day and gas type
+      group_by(year, week, day, gasId) %>% 
+      summarise(avgDayPriceFr = mean(price)), 
+    by = c("year", "week", "day", "gasId") # merging these with the original data.frame
+  ) %>% 
+  mutate(priceIndex = price / avgDayPriceFr * 100) %>% # computing the priceIndex
+  sdf_register(name = "spGasAll")
+```
+
+## Data Visualization
+```{r}
+tab = gasAll %>% 
+  group_by(gasType, weekIndex) %>% 
+  summarise(meanPrice = mean(price)) %>% # computing the mean price for each gasType and weekIndex
+  na.omit() %>% 
+  collect()
+
+# plotting for each gasType a line over the weeks
+tab %>% 
+  ggplot(aes(x = weekIndex, y = meanPrice, colour = factor(gasType))) +
+  geom_line() +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank()) +
+  labs(
+    y = "mean Price",
+    x = "week Index",
+    title = "Gas prices",
+    colour = "Gas Type"
+  )
+```
+
+As you can see the mean prices dropped a bit over time. For a short while the mean price are growing.
+# Data Visualization - Bonus question
+The question is formulated a bit ambiguous, thus I will interpret and assume aspects in order to visualize the price indexes.
+
+Since the mean of the price indexes over France is for each gas type 100 (see computation of price indexes), thus plotting mean price index per gas type and year is trivial. Thus I will commence with a heatmap of the mean prices per gas type and year.
+```{r}
+gasAll %>% 
+  group_by(gasType,year) %>% 
+  summarise(mean_price = mean(price)) %>% # aggregating (mean) the gas prices for each  year and gasType
+  na.omit() %>%
+  collect() %>% 
+  ggplot(aes(y = gasType, x = year)) + # plotting
+  geom_tile(aes(fill = mean_price),colour = "white") +
+  scale_fill_gradient(low = "gray90", high = "gray15") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank())
+```
+
+But one can compare the price index for rural and urban regions which I am going to in the following. First I plot heatmaps for both types seperate , be aware that the scales are not the same!
+```{r, warning=FALSE}
+tab = gasAll %>% 
+  group_by(gasType,year,pop) %>% 
+  summarise(price = mean(priceIndex)) %>% # as before aggregation
+  ungroup() %>% 
+  collect() %>% 
+  tidyr::spread(pop,price) %>% 
+  mutate(diff = A-R) # computing the difference between urban and rural gas prices
+
+# plotting urban heatmap
+lim = range(tab %>% select(A,R))
+tab %>% 
+  select(gasType, year, A) %>% 
+  na.omit() %>% 
+  ggplot(aes(y = gasType, x = year)) +
+  geom_tile(aes(fill = A),colour = "white") +
+  scale_fill_gradient(low = "gray90", high = "gray15") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank()) +
+  labs(
+    title = "Price index in urban region",
+    fill = "mean price Index"
+  )
+# plotting rural heatmap
+tab %>% 
+  select(gasType, year, R) %>% 
+  na.omit() %>% 
+  ggplot(aes(y = gasType, x = year)) +
+  geom_tile(aes(fill = R),colour = "white") +
+  scale_fill_gradient(low = "gray90", high = "gray15") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank()) +
+  labs(
+    title = "Price index in rural region",
+    fill = "mean price Index"
+  )
+```
+
+As one can see, the urban priceIndexes are higher than the mean (100) and the rual priceIndexes are smaller. Because the scales are not the same you can find a plot of the difference of the two heatmaps below, meaning the difference between urban and rural mean price Index.
+```{r}
+tab %>% 
+  select(gasType,year,diff) %>% 
+  na.omit() %>% 
+  ggplot(aes(y = gasType, x = year)) +
+  geom_tile(aes(fill = diff),colour = "white") +
+  scale_fill_gradient(low = "gray90", high = "gray15") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank()) + 
+  labs(
+    title = "Difference of urban and rural mean price index (urban - rural)",
+    fill = "Diff."
+  )
+```
+
+The white spaces correspond with fields without data.
+
+Another aspect how one can interpret the task can be to draw a real map, where the scale is showing the priceIndex. For that I use the ggmap package in combination with the ggplot package. I have selected only the prices for 2016.
+```{r}
+# downloading a map if it is not yet downloaded, otherwise the map is loaded
+if("map_france.Rdata" %in% list.files()){
+  load("map_france.Rdata")
+}else{
+  map = get_map(
+    location = c(left = -5.098, bottom = 42.033, right = 8.745, top = 51.372),
+    maptype = "toner-2011", color='bw'
+  )
+  save(map,file = "map_france.Rdata")
+}
+
+# preparing the data: filter and aggregating the data 
+tab = gasAll %>% 
+  filter(year == 2016) %>% 
+  group_by(gasType, lat, long) %>% 
+  summarise(meanPrice = mean(priceIndex)) %>% # computing mean price index for the grouping
+  ungroup() %>%
+  na.omit() %>%
+  collect()
+```
+
+I wrote a mapping function to easier plot the map for the different gas types. White spaces correspond to areas where there are no data.
+```{r, warning=FALSE}
+mapper = function(i, tab){
+  tmp_tab = tab %>% filter(gasType == i) %>% select(lat,long, meanPrice)
+  p = ggmap(map, extent = "device") +
+    stat_summary_2d( # this function computes the tile color, by the mean price index
+      data = tmp_tab, 
+      aes(x = long, y = lat, z = meanPrice), 
+      fun = mean, alpha = 0.75, bins = 40
+    ) +
+    scale_fill_gradient2(
+      name = "Price", 
+      low = "green",high = "red",
+      mid = "grey95", midpoint = as.numeric(tmp_tab %>% summarise(mean(meanPrice)))
+    ) + # Defining the colors used for the color scale.
+    labs( # changing labels
+      title = paste0("Regional mean price index for gas type ",i),
+      x = "longitude",
+      y = "latitude"
+    )
+  print(p)
+}
+
+# plotting for each gasType the map of France.
+gasTypes = unlist(unname(as.data.frame(tab %>% distinct(gasType) %>% collect())))
+for (i in gasTypes)
+  mapper(i,tab)
+```
+
+# Modeling option 1 - Forecast next day price
+
+Preparing an analytical base table for one Station (id = 32000004). I have selected this station because it has the most data points.
+```{r}
+# gasAll  %>% group_by(idStation) %>%  summarise(n = n()) %>% arrange(desc(n))
+rf_X = gasAll %>%
+  filter(idStation == 32000004) %>% # Filtering the data for one station
+  mutate(date2 = as.Date(date)) %>% # formats the date to a %Y-%m-%d format
+  group_by(date2, gasType, idStation) %>% # computing the mean price for each gasType and date
+  summarise(price = mean(price)) %>% 
+  ungroup() %>% 
+  collect() %>% # for the lag operator we need a local data.frame, which is computed by the command collect
+  group_by(gasType) %>% # for each gasType the lagged data for the price are added.
+  mutate(price_lagged1 = dplyr::lag(price, order_by = date2,n = 1)) %>% 
+  mutate(price_lagged2 = dplyr::lag(price, order_by = date2,n = 2)) %>% 
+  mutate(price_lagged3 = dplyr::lag(price, order_by = date2,n = 3)) %>% 
+  mutate(price_lagged4 = dplyr::lag(price, order_by = date2,n = 4)) %>% 
+  ungroup() %>% 
+  sdf_copy_to(sc,.,"sp_rf_X") # registering the file
+```
+
+Fitting the Random Forest regression model
+```{r, warning=FALSE}
+# formula: price ~ price_lagged1 + ... + price_lagged4
+frml = paste0("price_lagged",1:4)
+frml = paste0("price ~ ", paste0(frml,collapse = " + "))
+# Fitting a random forest model regression for formula for each gasType
+gasTypes = unname(unlist(as.data.frame(rf_X %>% distinct(gasType) %>% collect())))
+rf_pred = lapply(gasTypes, function(i){
+  # Fitting the model for the formula
+  tmpData = rf_X %>% filter(gasType == i) %>% na.omit()
+  if (nrow(tmpData %>% collect()) == 0)
+    return(NULL)
+  rf_model = sparklyr::ml_random_forest(
+    x = tmpData,
+    response = as.formula(frml)
+  )
+  # computing the prediction for the RF model
+  tmp = sparklyr::sdf_predict(
+    object =  rf_model, 
+    newdata = rf_X %>% filter(gasType == i) %>%  na.omit()
+  )
+  return(tmp)
+})
+
+# Combinining the distinct data.frames (each one is for one gas type) plus additional changes (see comments)
+rf_X2 = sdf_bind_rows(rf_pred) %>% 
+  arrange(date2) %>% #sorting the data by date2
+  mutate(error = price - prediction) %>% # computation of the prediction error
+  sdf_register(name= "sp_rf_X2") #registering the spark data.frame.
+```
+
+Plotting the real vs predicted prices. 
+```{r}
+rf_X2 %>% 
+  collect() %>% 
+  tidyr::gather(.,type,price, price, prediction) %>% # combining the two columns price and prediction in order to use the type as variable in ggplot
+  ggplot(aes(
+    x = as.Date(date2), 
+    y = price, 
+    colour = gasType, 
+    lty = factor(type, levels = c("price","prediction"))
+  )) +
+  geom_line() +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank()) +
+  labs(
+    y = "Value",
+    x = "Date",
+    title = "Prediction of RF regression vs Real Prices",
+    lty = "type",
+    colour = "Gas type"
+  )
+```
+
+The prediction is very close to the actual price thus quite well. But we can see, that there are gas types wich do not have lots of data points and are therefore hard to interpret, especially in the following analysis one should keep this in mind.
+
+Plot of the prediction error.
+```{r}
+rf_X2 %>% 
+  collect() %>% 
+  ggplot(aes(x = as.Date(date2), y = error, colour = gasType)) +
+  geom_line() +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank()) +
+  ylab("Error") +
+  xlab("Date") +
+  ggtitle("Prediction error of RF regression")
+```
+
+As an accuracy measure I compute the mean squared and absolute prediction error (MSPE and MAPE) for the different gas types. The number of predicted points are also computed to show which gas types should be looked carefully.
+```{r}
+rf_X2 %>% 
+  group_by(gasType) %>% # grouping according to gasType
+  summarise(MSPE = mean(error^2), MAPE = mean(abs(error)), number = n()) %>% # summarizing.
+  collect()
+```
+
+Another method to compare the prediction is to plot a histogram or density plot of the error.
+```{r}
+rf_X2 %>% 
+  select(error, gasType) %>% # selecting variables
+  collect() %>% 
+  ggplot(aes(error, colour = gasType)) + # plotting the error for each gasType
+    geom_density(lwd = 1, adjust = 3) + # density plot
+    theme_bw() +
+    ylab("Density") + # relabeling y,x axis, title and the legend
+    xlab("Error") +
+    ggtitle("Density plot of Error") +
+    labs(colour = "Gas type")
+```
+
+The RF regression model seems to lead to predictions which errors are symmetric. Which hints that our model error might be independent with respect to the time. A test for indepence and a White Noise test might give some indication of this. First I have a look at the ACFs of the gas types, excluding the ones with to little data.
+```{r}
+tab = rf_X2 %>% 
+  select(error,gasType, date2) %>% # selecting the variables
+  collect() %>% 
+  tidyr::spread(., gasType, error) # spreading the data, such that there is for each gasType a variable with the name of the gasType containing the error
+par(mfrow = c(1,2))
+for (i in gasTypes[!gasTypes %in% c("E85", "GPLc")]){
+  acf(tab %>% select(i) %>% na.omit()) # plotting the ACF function for each gasType. Alternatively one could do acf(tab %>% na.omit()) to get also the cross correlation for each combination of gasTypes. But since we know that the gas price is highly dependent on the oil price and not vice versa (Granger Causal), this has only little to no real interpreational value.
+}
+```
+
+We can see 2 types of correlation types: First one where the ACF is significant for the first few lagged values but gets closer to 0 fast (SP98) and second seasonally effected (periodicity 6) series (other shown gas types). For those seasonally effected it might be a good idea to also include further lagged data points, or even using aggregated lagged values, like the lagged mean week prices.
+
+The Box-Ljung test is a test based on the auto correlation, its null hypothesis $H_0$ is assuming independently distributed data. Thus $p$-values smaller than $\alpha$ reject $H_0$ and thus are statisticly speaking not independent, and more general not a White Noise process.
+```{r}
+for (i in gasTypes){
+  cat(i,"\n")
+  p = Box.test(tab %>% select(i) %>% na.omit(),type="Ljung-Box") # Box Ljung test
+  print(p)
+}
+```
+
+One could argue, that here as well the two gas types which have very little predicted data points should be neglected as well, but the Box-Ljung test is taking this feature into account. 
+The null hypothesis is rejected for E10, SP95, SP98 and Gazole which is not surprising since it was shown that the ACF of these showed either significant correlation with the first few lagged values or had seasonal effects.
+# Disconnecting from the Spark session.
+```{r}
+spark_disconnect_all()
+```
